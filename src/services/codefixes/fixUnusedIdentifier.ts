@@ -3,6 +3,7 @@ namespace ts.codefix {
     const fixName = "unusedIdentifier";
     const fixIdPrefix = "unusedIdentifier_prefix";
     const fixIdDelete = "unusedIdentifier_delete";
+    const fixIdDeleteImports = "unusedIdentifier_deleteImports";
     const fixIdInfer = "unusedIdentifier_infer";
     const errorCodes = [
         Diagnostics._0_is_declared_but_its_value_is_never_read.code,
@@ -17,7 +18,7 @@ namespace ts.codefix {
     registerCodeFix({
         errorCodes,
         getCodeActions(context) {
-            const { errorCode, sourceFile, program } = context;
+            const { errorCode, sourceFile, program, cancellationToken } = context;
             const checker = program.getTypeChecker();
             const sourceFiles = program.getSourceFiles();
             const token = getTokenAtPosition(sourceFile, context.span.start);
@@ -32,7 +33,13 @@ namespace ts.codefix {
             const importDecl = tryGetFullImport(token);
             if (importDecl) {
                 const changes = textChanges.ChangeTracker.with(context, t => t.delete(sourceFile, importDecl));
-                return [createDeleteFix(changes, [Diagnostics.Remove_import_from_0, showModuleSpecifier(importDecl)])];
+                return [createCodeFixAction(fixName, changes, [Diagnostics.Remove_import_from_0, showModuleSpecifier(importDecl)], fixIdDeleteImports, Diagnostics.Delete_all_unused_imports)];
+            }
+            else if (isImport(token)) {
+                const deletion = textChanges.ChangeTracker.with(context, t => tryDeleteDeclaration(sourceFile, token, t, checker, sourceFiles, program, cancellationToken, /*isFixAll*/ false));
+                if (deletion.length) {
+                    return [createCodeFixAction(fixName, deletion, [Diagnostics.Remove_unused_declaration_for_Colon_0, token.getText(sourceFile)], fixIdDeleteImports, Diagnostics.Delete_all_unused_imports)];
+                }
             }
 
             if (isObjectBindingPattern(token.parent)) {
@@ -68,7 +75,7 @@ namespace ts.codefix {
             }
             else {
                 const deletion = textChanges.ChangeTracker.with(context, t =>
-                    tryDeleteDeclaration(sourceFile, token, t, checker, sourceFiles, /*isFixAll*/ false));
+                    tryDeleteDeclaration(sourceFile, token, t, checker, sourceFiles, program, cancellationToken, /*isFixAll*/ false));
                 if (deletion.length) {
                     const name = isComputedPropertyName(token.parent) ? token.parent : token;
                     result.push(createDeleteFix(deletion, [Diagnostics.Remove_unused_declaration_for_Colon_0, name.getText(sourceFile)]));
@@ -82,9 +89,9 @@ namespace ts.codefix {
 
             return result;
         },
-        fixIds: [fixIdPrefix, fixIdDelete, fixIdInfer],
+        fixIds: [fixIdPrefix, fixIdDelete, fixIdDeleteImports, fixIdInfer],
         getAllCodeActions: context => {
-            const { sourceFile, program } = context;
+            const { sourceFile, program, cancellationToken } = context;
             const checker = program.getTypeChecker();
             const sourceFiles = program.getSourceFiles();
             return codeFixAll(context, errorCodes, (changes, diag) => {
@@ -93,13 +100,19 @@ namespace ts.codefix {
                     case fixIdPrefix:
                         tryPrefixDeclaration(changes, diag.code, sourceFile, token);
                         break;
-                    case fixIdDelete: {
-                        if (token.kind === SyntaxKind.InferKeyword) {
-                            break; // Can't delete
-                        }
+                    case fixIdDeleteImports: {
                         const importDecl = tryGetFullImport(token);
                         if (importDecl) {
                             changes.delete(sourceFile, importDecl);
+                        }
+                        else if (isImport(token)) {
+                            tryDeleteDeclaration(sourceFile, token, changes, checker, sourceFiles, program, cancellationToken, /*isFixAll*/ true);
+                        }
+                        break;
+                    }
+                    case fixIdDelete: {
+                        if (token.kind === SyntaxKind.InferKeyword || isImport(token)) {
+                            break; // Can't delete
                         }
                         else if (isJSDocTemplateTag(token)) {
                             changes.delete(sourceFile, token);
@@ -119,7 +132,7 @@ namespace ts.codefix {
                             deleteEntireVariableStatement(changes, sourceFile, <VariableDeclarationList>token.parent);
                         }
                         else {
-                            tryDeleteDeclaration(sourceFile, token, changes, checker, sourceFiles, /*isFixAll*/ true);
+                            tryDeleteDeclaration(sourceFile, token, changes, checker, sourceFiles, program, cancellationToken, /*isFixAll*/ true);
                         }
                         break;
                     }
@@ -145,6 +158,11 @@ namespace ts.codefix {
 
     function deleteTypeParameters(changes: textChanges.ChangeTracker, sourceFile: SourceFile, token: Node): void {
         changes.delete(sourceFile, Debug.checkDefined(cast(token.parent, isDeclarationWithTypeParameterChildren).typeParameters, "The type parameter to delete should exist"));
+    }
+
+    function isImport(token: Node) {
+        return token.kind === SyntaxKind.ImportKeyword
+            || token.kind === SyntaxKind.Identifier && (token.parent.kind === SyntaxKind.ImportSpecifier || token.parent.kind === SyntaxKind.ImportClause);
     }
 
     // Sometimes the diagnostic span is an entire ImportDeclaration, so we should remove the whole thing.
@@ -199,8 +217,8 @@ namespace ts.codefix {
         return false;
     }
 
-    function tryDeleteDeclaration(sourceFile: SourceFile, token: Node, changes: textChanges.ChangeTracker, checker: TypeChecker, sourceFiles: readonly SourceFile[], isFixAll: boolean) {
-        tryDeleteDeclarationWorker(token, changes, sourceFile, checker, sourceFiles, isFixAll);
+    function tryDeleteDeclaration(sourceFile: SourceFile, token: Node, changes: textChanges.ChangeTracker, checker: TypeChecker, sourceFiles: readonly SourceFile[], program: Program, cancellationToken: CancellationToken, isFixAll: boolean) {
+        tryDeleteDeclarationWorker(token, changes, sourceFile, checker, sourceFiles, program, cancellationToken, isFixAll);
         if (isIdentifier(token)) deleteAssignments(changes, sourceFile, token, checker);
     }
 
@@ -213,23 +231,21 @@ namespace ts.codefix {
         });
     }
 
-    function tryDeleteDeclarationWorker(token: Node, changes: textChanges.ChangeTracker, sourceFile: SourceFile, checker: TypeChecker, sourceFiles: readonly SourceFile[], isFixAll: boolean): void {
+    function tryDeleteDeclarationWorker(token: Node, changes: textChanges.ChangeTracker, sourceFile: SourceFile, checker: TypeChecker, sourceFiles: readonly SourceFile[], program: Program, cancellationToken: CancellationToken, isFixAll: boolean): void {
         const { parent } = token;
         if (isParameter(parent)) {
-            tryDeleteParameter(changes, sourceFile, parent, checker, sourceFiles, isFixAll);
+            tryDeleteParameter(changes, sourceFile, parent, checker, sourceFiles, program, cancellationToken, isFixAll);
         }
         else {
             changes.delete(sourceFile, isImportClause(parent) ? token : isComputedPropertyName(parent) ? parent.parent : parent);
         }
     }
 
-    function tryDeleteParameter(changes: textChanges.ChangeTracker, sourceFile: SourceFile, p: ParameterDeclaration, checker: TypeChecker, sourceFiles: readonly SourceFile[], isFixAll = false): void {
-        if (mayDeleteParameter(p, checker, isFixAll)) {
-            if (p.modifiers && p.modifiers.length > 0
-                    && (!isIdentifier(p.name) || FindAllReferences.Core.isSymbolReferencedInFile(p.name, checker, sourceFile))) {
-                p.modifiers.forEach(modifier => {
-                    changes.deleteModifier(sourceFile, modifier);
-                });
+    function tryDeleteParameter(changes: textChanges.ChangeTracker, sourceFile: SourceFile, p: ParameterDeclaration, checker: TypeChecker, sourceFiles: readonly SourceFile[], program: Program, cancellationToken: CancellationToken, isFixAll = false): void {
+        if (mayDeleteParameter(checker, sourceFile, p, sourceFiles, program, cancellationToken, isFixAll)) {
+            if (p.modifiers && p.modifiers.length > 0 &&
+                (!isIdentifier(p.name) || FindAllReferences.Core.isSymbolReferencedInFile(p.name, checker, sourceFile))) {
+                p.modifiers.forEach(modifier => changes.deleteModifier(sourceFile, modifier));
             }
             else {
                 changes.delete(sourceFile, p);
@@ -238,29 +254,47 @@ namespace ts.codefix {
         }
     }
 
-    function mayDeleteParameter(p: ParameterDeclaration, checker: TypeChecker, isFixAll: boolean): boolean {
-        const { parent } = p;
+    function mayDeleteParameter(checker: TypeChecker, sourceFile: SourceFile, parameter: ParameterDeclaration, sourceFiles: readonly SourceFile[], program: Program, cancellationToken: CancellationToken, isFixAll: boolean): boolean {
+        const { parent } = parameter;
         switch (parent.kind) {
             case SyntaxKind.MethodDeclaration:
-                // Don't remove a parameter if this overrides something.
-                const symbol = checker.getSymbolAtLocation(parent.name)!;
-                if (isMemberSymbolInBaseType(symbol, checker)) return false;
-                // falls through
-
             case SyntaxKind.Constructor:
-            case SyntaxKind.FunctionDeclaration:
+                const index = parent.parameters.indexOf(parameter);
+                const referent = isMethodDeclaration(parent) ? parent.name : parent;
+                const entries = FindAllReferences.Core.getReferencedSymbolsForNode(parent.pos, referent, program, sourceFiles, cancellationToken);
+                if (entries) {
+                    for (const entry of entries) {
+                        for (const reference of entry.references) {
+                            if (reference.kind === FindAllReferences.EntryKind.Node) {
+                                // argument in super(...)
+                                const isSuperCall = isSuperKeyword(reference.node)
+                                    && isCallExpression(reference.node.parent)
+                                    && reference.node.parent.arguments.length > index;
+                                // argument in super.m(...)
+                                const isSuperMethodCall = isPropertyAccessExpression(reference.node.parent)
+                                    && isSuperKeyword(reference.node.parent.expression)
+                                    && isCallExpression(reference.node.parent.parent)
+                                    && reference.node.parent.parent.arguments.length > index;
+                                // parameter in overridden or overriding method
+                                const isOverriddenMethod = (isMethodDeclaration(reference.node.parent) || isMethodSignature(reference.node.parent))
+                                    && reference.node.parent !== parameter.parent
+                                    && reference.node.parent.parameters.length > index;
+                                if (isSuperCall || isSuperMethodCall || isOverriddenMethod) return false;
+                            }
+                        }
+                    }
+                }
                 return true;
-
-            case SyntaxKind.FunctionExpression:
-            case SyntaxKind.ArrowFunction: {
-                // Can't remove a non-last parameter in a callback. Can remove a parameter in code-fix-all if future parameters are also unused.
-                const { parameters } = parent;
-                const index = parameters.indexOf(p);
-                Debug.assert(index !== -1, "The parameter should already be in the list");
-                return isFixAll
-                    ? parameters.slice(index + 1).every(p => p.name.kind === SyntaxKind.Identifier && !p.symbol.isReferenced)
-                    : index === parameters.length - 1;
+            case SyntaxKind.FunctionDeclaration: {
+                if (parent.name && isCallbackLike(checker, sourceFile, parent.name)) {
+                    return isLastParameter(parent, parameter, isFixAll);
+                }
+                return true;
             }
+            case SyntaxKind.FunctionExpression:
+            case SyntaxKind.ArrowFunction:
+                // Can't remove a non-last parameter in a callback. Can remove a parameter in code-fix-all if future parameters are also unused.
+                return isLastParameter(parent, parameter, isFixAll);
 
             case SyntaxKind.SetAccessor:
                 // Setter must have a parameter
@@ -278,5 +312,19 @@ namespace ts.codefix {
                 changes.delete(sourceFile, call.arguments[index]);
             }
         });
+    }
+
+    function isCallbackLike(checker: TypeChecker, sourceFile: SourceFile, name: Identifier): boolean {
+        return !!FindAllReferences.Core.eachSymbolReferenceInFile(name, checker, sourceFile, reference =>
+            isIdentifier(reference) && isCallExpression(reference.parent) && reference.parent.arguments.indexOf(reference) >= 0);
+    }
+
+    function isLastParameter(func: FunctionLikeDeclaration, parameter: ParameterDeclaration, isFixAll: boolean): boolean {
+        const parameters = func.parameters;
+        const index = parameters.indexOf(parameter);
+        Debug.assert(index !== -1, "The parameter should already be in the list");
+        return isFixAll ?
+            parameters.slice(index + 1).every(p => isIdentifier(p.name) && !p.symbol.isReferenced) :
+            index === parameters.length - 1;
     }
 }
